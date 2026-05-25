@@ -1,10 +1,17 @@
 # Agent Governance Gateway
 
+[![FastAPI](https://img.shields.io/badge/FASTAPI-009688?style=for-the-badge&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
+[![Python](https://img.shields.io/badge/PYTHON_3.12-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
+[![JWT](https://img.shields.io/badge/SCOPED_JWT-111827?style=for-the-badge)](#scoped-agent-access-instead-of-unrestricted-credentials)
+[![Policy Engine](https://img.shields.io/badge/POLICY_ENGINE-6D28D9?style=for-the-badge)](#policy-enforced-tool-gateway)
+[![CI](https://img.shields.io/github/actions/workflow/status/danieloza/agent-governance-gateway/ci.yml?branch=main&style=for-the-badge&label=CI)](https://github.com/danieloza/agent-governance-gateway/actions)
+[![License: MIT](https://img.shields.io/badge/LICENSE-MIT-0F172A?style=for-the-badge)](LICENSE)
+
 Agent Governance Gateway is a FastAPI-based prototype for scoped, auditable and revocable access control for enterprise AI agents. Instead of giving agents unrestricted API keys, the gateway supports agent registration, human approval, short-lived scoped credentials, policy checks, PII redaction, tool-level access control and audit logs.
 
 This project is positioned as a governance and access-control layer for internal AI automation across HR, Finance, Legal and Operations workflows. It is not a chatbot. It is the security boundary around agent execution.
 
-## Why this project exists
+## Product Thesis
 
 Enterprise AI agents often need access to policies, invoices, contracts, reports and internal systems. The unsafe shortcut is to hand the agent raw API keys or direct database access.
 
@@ -26,6 +33,17 @@ Agent Governance Gateway enforces a safer sequence:
 5. every tool call goes through policy enforcement
 6. PII is redacted before responses leave the boundary
 7. every important action is written to the audit trail
+
+## What This Proves
+
+This project demonstrates how to design a security boundary for AI agents operating inside business workflows:
+
+- agents receive scoped, short-lived credentials instead of raw internal API keys
+- human approval is modeled as part of the access lifecycle
+- every tool call is checked against policy, tenant, scope, approval and revocation state
+- sensitive mock business data is redacted before leaving the gateway
+- audit logs explain what happened, who/what requested access, and why the request was allowed or denied
+- the dashboard gives operators a review surface instead of hiding governance inside logs
 
 ## Screenshots
 
