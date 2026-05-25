@@ -1,0 +1,683 @@
+from __future__ import annotations
+
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from time import perf_counter
+
+from fastapi import Depends, FastAPI, HTTPException, Query, status
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session
+
+from app.audit import write_audit_log
+from app.auth import create_scoped_token, get_token_payload
+from app.config import get_settings
+from app.database import Base, engine, get_db
+from app.models import Agent, ApprovalRecord, AuditLog
+from app.policies import TOOL_SCOPE_MAP, evaluate_tool_access
+from app.redaction import redact_pii
+from app.schemas import (
+    AgentAuthManifest,
+    AgentRegistrationRequest,
+    AgentRegistrationResponse,
+    ApprovalRequest,
+    ApprovalResponse,
+    AuditLogResponse,
+    EmployeePolicySearchRequest,
+    ExpenseReviewRequest,
+    InvoiceSummaryRequest,
+    ContractClauseRequest,
+    ContractRiskRequest,
+    ManifestPolicyRules,
+    OpsReportRequest,
+    RevocationRequest,
+    RevocationResponse,
+    TokenRequest,
+    TokenResponse,
+    ToolResponse,
+    VALID_SCOPES,
+)
+from app.tools import (
+    finance_create_expense_review,
+    finance_get_invoice_summary,
+    hr_search_employee_policy,
+    legal_search_contract_clause,
+    legal_summarize_contract_risk,
+    ops_create_report,
+)
+
+settings = get_settings()
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+    Base.metadata.create_all(bind=engine)
+    if settings.demo_seed_enabled and settings.environment != "test":
+        seed_demo_data()
+    yield
+
+
+app = FastAPI(
+    title=settings.app_name,
+    version="0.1.0",
+    description=(
+        "Agent Governance Gateway is a FastAPI-based prototype for scoped, auditable and revocable "
+        "access control for enterprise AI agents."
+    ),
+    lifespan=lifespan,
+)
+STATIC_DIR = Path(__file__).parent / "static"
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+
+def ensure_utc(dt: datetime | None) -> datetime | None:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+def parse_scopes(value: str | None) -> list[str]:
+    if not value:
+        return []
+    return [scope for scope in value.split(",") if scope]
+
+
+def seed_demo_data() -> None:
+    with Session(engine) as db:
+        has_agents = db.scalar(select(func.count(Agent.id)))
+        if has_agents:
+            return
+
+        now = datetime.now(timezone.utc)
+        demo_agents = [
+            Agent(
+                agent_name="HR Policy Assistant",
+                agent_type="mcp_client",
+                requested_scopes="hr:policy:read",
+                approved_scopes="hr:policy:read",
+                owner_user_id="anna.kowalska",
+                reason="HR Department",
+                status="approved",
+                approved_by="daniel.ozarski",
+                approval_expires_at=now + timedelta(hours=24),
+            ),
+            Agent(
+                agent_name="Finance Invoice Agent",
+                agent_type="service_agent",
+                requested_scopes="finance:invoice:read,finance:expense:create",
+                approved_scopes="finance:invoice:read",
+                owner_user_id="michal.nowak",
+                reason="Finance Department",
+                status="pending_approval",
+            ),
+            Agent(
+                agent_name="Legal Contract Analyst",
+                agent_type="mcp_client",
+                requested_scopes="legal:contract:read,legal:risk:summarize",
+                approved_scopes="legal:contract:read",
+                owner_user_id="justyna.zz",
+                reason="Legal Department",
+                status="approved",
+                approved_by="daniel.ozarski",
+                approval_expires_at=now + timedelta(hours=12),
+            ),
+            Agent(
+                agent_name="Ops Report Builder",
+                agent_type="workflow_agent",
+                requested_scopes="ops:report:create",
+                approved_scopes="ops:report:create",
+                owner_user_id="piotr.wrobel",
+                reason="Operations",
+                status="revoked",
+                approved_by="daniel.ozarski",
+                approval_expires_at=now + timedelta(hours=6),
+                revoked_at=now - timedelta(minutes=30),
+                revoked_by="daniel.ozarski",
+                revocation_reason="Workflow frozen after policy review",
+            ),
+        ]
+        db.add_all(demo_agents)
+        db.commit()
+
+        agents = list(db.scalars(select(Agent)).all())
+        by_name = {agent.agent_name: agent for agent in agents}
+
+        demo_logs = [
+            AuditLog(
+                agent_id=by_name["Finance Invoice Agent"].id,
+                owner_user_id="michal.nowak",
+                action="registration",
+                decision="pending",
+                reason="Agent registered and waiting for approval",
+                policy_version=settings.policy_version,
+                pii_redacted=True,
+            ),
+            AuditLog(
+                agent_id=by_name["HR Policy Assistant"].id,
+                owner_user_id="anna.kowalska",
+                action="approval",
+                tool_name=None,
+                decision="allowed",
+                reason="Approved by daniel.ozarski",
+                policy_version=settings.policy_version,
+                pii_redacted=True,
+            ),
+            AuditLog(
+                agent_id=by_name["HR Policy Assistant"].id,
+                owner_user_id="anna.kowalska",
+                action="token_issuing",
+                decision="allowed",
+                reason="Scoped token issued",
+                policy_version=settings.policy_version,
+                pii_redacted=True,
+            ),
+            AuditLog(
+                agent_id=by_name["Legal Contract Analyst"].id,
+                owner_user_id="justyna.zz",
+                action="denied_tool_call",
+                tool_name="legal.search_contract_clause",
+                requested_scope="legal:contract:read",
+                decision="denied",
+                reason="default_deny: required scope missing from token",
+                policy_version=settings.policy_version,
+                pii_redacted=True,
+                latency_ms=18,
+            ),
+            AuditLog(
+                agent_id=by_name["HR Policy Assistant"].id,
+                owner_user_id="anna.kowalska",
+                action="allowed_tool_call",
+                tool_name="hr.search_employee_policy",
+                requested_scope="hr:policy:read",
+                decision="allowed",
+                reason="allowed",
+                policy_version=settings.policy_version,
+                pii_redacted=True,
+                latency_ms=11,
+            ),
+            AuditLog(
+                agent_id=by_name["Ops Report Builder"].id,
+                owner_user_id="piotr.wrobel",
+                action="revocation",
+                decision="revoked",
+                reason="Revoked by daniel.ozarski: Workflow frozen after policy review",
+                policy_version=settings.policy_version,
+                pii_redacted=True,
+            ),
+        ]
+        db.add_all(demo_logs)
+        db.commit()
+
+
+def get_agent_or_404(db: Session, agent_id: int) -> Agent:
+    agent = db.get(Agent, agent_id)
+    if agent is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent not found")
+    return agent
+
+
+def validate_scopes(scopes: list[str], *, agent_id: int | None, owner_user_id: str, db: Session) -> None:
+    invalid = [scope for scope in scopes if scope not in VALID_SCOPES]
+    if invalid:
+        write_audit_log(
+            db,
+            agent_id=agent_id,
+            owner_user_id=owner_user_id,
+            action="invalid_scope_attempt",
+            decision="denied",
+            reason=f"Invalid scopes requested: {', '.join(invalid)}",
+            requested_scope=",".join(invalid),
+        )
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail={"invalid_scopes": invalid})
+
+
+def build_tool_response(*, tool_name: str, required_scope: str, payload: dict) -> ToolResponse:
+    redacted_payload = redact_pii(payload)
+    return ToolResponse(
+        tool_name=tool_name,
+        scope_used=required_scope,
+        policy_version=settings.policy_version,
+        pii_redacted=True,
+        data=redacted_payload,
+    )
+
+
+def enforce_tool_policy(
+    *,
+    tool_name: str,
+    token_payload: dict,
+    db: Session,
+) -> tuple[Agent, str]:
+    started = perf_counter()
+    agent_id = int(token_payload["agent_id"])
+    agent = db.get(Agent, agent_id)
+    decision = evaluate_tool_access(
+        agent=agent,
+        token_payload=token_payload,
+        tool_name=tool_name,
+        policy_version=settings.policy_version,
+    )
+    latency_ms = int((perf_counter() - started) * 1000)
+    owner_user_id = token_payload.get("owner_user_id")
+
+    if not decision.allowed:
+        action = "policy_failure" if "default_deny" in decision.reason else "denied_tool_call"
+        write_audit_log(
+            db,
+            agent_id=agent_id,
+            owner_user_id=owner_user_id,
+            action=action,
+            tool_name=tool_name,
+            requested_scope=decision.required_scope,
+            decision="denied",
+            reason=decision.reason,
+            pii_redacted=decision.pii_redaction_required,
+            latency_ms=latency_ms,
+        )
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=decision.reason)
+
+    write_audit_log(
+        db,
+        agent_id=agent_id,
+        owner_user_id=owner_user_id,
+        action="allowed_tool_call",
+        tool_name=tool_name,
+        requested_scope=decision.required_scope,
+        decision="allowed",
+        reason=decision.reason,
+        pii_redacted=decision.pii_redaction_required,
+        latency_ms=latency_ms,
+    )
+    return agent, decision.required_scope
+
+
+@app.get("/", include_in_schema=False)
+def dashboard_home() -> FileResponse:
+    return FileResponse(STATIC_DIR / "index.html")
+
+
+@app.get("/dashboard/overview", tags=["dashboard"])
+def dashboard_overview(db: Session = Depends(get_db)) -> dict:
+    agents = list(db.scalars(select(Agent).order_by(Agent.created_at.desc())).all())
+    audit_logs = list(db.scalars(select(AuditLog).order_by(AuditLog.timestamp.desc())).all())
+
+    total_agents = len(agents)
+    pending_approvals = sum(1 for agent in agents if agent.status == "pending_approval")
+    approved_agents = sum(1 for agent in agents if agent.status == "approved")
+    revoked_agents = sum(1 for agent in agents if agent.status == "revoked")
+    active_tokens = sum(1 for log in audit_logs if log.action == "token_issuing" and log.decision == "allowed")
+    denied_requests = sum(1 for log in audit_logs if log.decision == "denied")
+
+    scope_counts: dict[str, int] = {scope: 0 for scope in VALID_SCOPES}
+    for agent in agents:
+        for scope in parse_scopes(agent.approved_scopes):
+            if scope in scope_counts:
+                scope_counts[scope] += 1
+
+    max_scope_count = max(scope_counts.values()) if scope_counts else 1
+    scope_distribution = [
+        {"scope": scope, "count": count, "percent": int((count / max_scope_count) * 100) if max_scope_count else 0}
+        for scope, count in scope_counts.items()
+    ]
+
+    allowed_counts = [44, 55, 68, 68, 50, 43, 48]
+    denied_counts = [4, 6, 9, 18, 7, 8, 11]
+
+    return {
+        "metrics": {
+            "total_agents": total_agents,
+            "pending_approvals": pending_approvals,
+            "approved_agents": approved_agents,
+            "revoked_agents": revoked_agents,
+            "active_tokens": active_tokens,
+            "denied_requests": denied_requests,
+            "sparkline": [
+                [22, 29, 25, 36, 30, 40, 33, 47],
+                [12, 14, 18, 15, 13, 19, 16, 26],
+                [18, 24, 20, 28, 25, 30, 27, 34],
+                [9, 12, 18, 14, 17, 19, 16, 28],
+            ],
+        },
+        "scope_distribution": scope_distribution,
+        "tool_usage": [
+            {"label": "May 19", "allowed": allowed_counts[0] * 2, "denied": denied_counts[0] * 6},
+            {"label": "May 20", "allowed": allowed_counts[1] * 2, "denied": denied_counts[1] * 6},
+            {"label": "May 21", "allowed": allowed_counts[2] * 2, "denied": denied_counts[2] * 6},
+            {"label": "May 22", "allowed": allowed_counts[3] * 2, "denied": denied_counts[3] * 6},
+            {"label": "May 23", "allowed": allowed_counts[4] * 2, "denied": denied_counts[4] * 6},
+            {"label": "May 24", "allowed": allowed_counts[5] * 2, "denied": denied_counts[5] * 6},
+            {"label": "May 25", "allowed": allowed_counts[6] * 2, "denied": denied_counts[6] * 6},
+        ],
+        "policy_controls": [
+            {"name": "Default policy", "detail": "Default deny on every tool access"},
+            {"name": "PII redaction", "detail": "Enabled for responses and audit-safe outputs"},
+            {"name": "Audit logging", "detail": "Registration, token issue, policy decision and revocation"},
+            {"name": "Token expiration", "detail": "Short-lived scoped JWT credentials"},
+            {"name": "Policy version", "detail": settings.policy_version},
+        ],
+    }
+
+
+@app.get("/dashboard/access-requests", tags=["dashboard"])
+def dashboard_access_requests(db: Session = Depends(get_db)) -> dict:
+    agents = list(db.scalars(select(Agent).order_by(Agent.created_at.desc())).all())
+    rows = []
+    for agent in agents:
+        approval_expires_at = ensure_utc(agent.approval_expires_at)
+        created_at = ensure_utc(agent.created_at)
+        revoked_at = ensure_utc(agent.revoked_at)
+        rows.append(
+            {
+                "agent_id": agent.id,
+                "agent_name": agent.agent_name,
+                "agent_type": agent.agent_type,
+                "requested_scopes": parse_scopes(agent.requested_scopes),
+                "approved_scopes": parse_scopes(agent.approved_scopes),
+                "owner_user_id": agent.owner_user_id,
+                "reason": agent.reason,
+                "status": "pending" if agent.status == "pending_approval" else agent.status,
+                "approval_window": approval_expires_at.isoformat() if approval_expires_at else "Awaiting approval",
+                "approved_by": agent.approved_by,
+                "revoked_by": agent.revoked_by,
+                "revoked_at": revoked_at.isoformat() if revoked_at else None,
+                "revocation_reason": agent.revocation_reason,
+                "created_at": created_at.isoformat() if created_at else None,
+            }
+        )
+    return {"rows": rows}
+
+
+@app.get("/dashboard/recent-activity", tags=["dashboard"])
+def dashboard_recent_activity(db: Session = Depends(get_db)) -> dict:
+    logs = list(db.scalars(select(AuditLog).order_by(AuditLog.timestamp.desc(), AuditLog.id.desc()).limit(6)).all())
+    items = []
+    for log in logs:
+        title = log.action.replace("_", " ").title()
+        timestamp = ensure_utc(log.timestamp)
+        items.append(
+            {
+                "id": log.id,
+                "agent_id": log.agent_id,
+                "owner_user_id": log.owner_user_id,
+                "title": title,
+                "meta": log.reason,
+                "decision": log.decision,
+                "icon": "",
+                "timestamp": timestamp.strftime("%H:%M UTC") if timestamp else "n/a",
+                "timestamp_iso": timestamp.isoformat() if timestamp else None,
+                "tool_name": log.tool_name,
+                "requested_scope": log.requested_scope,
+                "policy_version": log.policy_version,
+                "pii_redacted": log.pii_redacted,
+                "latency_ms": log.latency_ms,
+                "action": log.action,
+            }
+        )
+    return {"items": items}
+
+
+@app.get("/.well-known/agent-auth.json", response_model=AgentAuthManifest, tags=["agent-auth"])
+def get_manifest() -> AgentAuthManifest:
+    return AgentAuthManifest(
+        auth_flows_supported=["agent_registration", "human_approval", "scoped_jwt_token"],
+        credential_type="jwt",
+        token_endpoint="/agent-auth/token",
+        approval_endpoint="/agent-auth/approve/{agent_id}",
+        revocation_endpoint="/agent-auth/revoke/{agent_id}",
+        audit_endpoint="/agent-auth/audit",
+        available_scopes=VALID_SCOPES,
+        policy_rules=ManifestPolicyRules(
+            default_deny=True,
+            short_lived_scoped_tokens=True,
+            human_approval_required=True,
+            pii_redaction_enabled=True,
+            audit_logging_enabled=True,
+            revocation_supported=True,
+        ),
+    )
+
+
+@app.post("/agent-auth/register", response_model=AgentRegistrationResponse, status_code=status.HTTP_201_CREATED, tags=["agent-auth"])
+def register_agent(payload: AgentRegistrationRequest, db: Session = Depends(get_db)) -> AgentRegistrationResponse:
+    validate_scopes(payload.requested_scopes, agent_id=None, owner_user_id=payload.owner_user_id, db=db)
+    agent = Agent(
+        agent_name=payload.agent_name,
+        agent_type=payload.agent_type,
+        requested_scopes=",".join(payload.requested_scopes),
+        owner_user_id=payload.owner_user_id,
+        reason=payload.reason,
+        callback_url=str(payload.callback_url) if payload.callback_url else None,
+        status="pending_approval",
+    )
+    db.add(agent)
+    db.commit()
+    db.refresh(agent)
+
+    write_audit_log(
+        db,
+        agent_id=agent.id,
+        owner_user_id=agent.owner_user_id,
+        action="registration",
+        decision="pending",
+        reason="Agent registered and waiting for human approval",
+        requested_scope=agent.requested_scopes,
+    )
+    return AgentRegistrationResponse(agent_id=agent.id, status=agent.status, requested_scopes=payload.requested_scopes)
+
+
+@app.post("/agent-auth/approve/{agent_id}", response_model=ApprovalResponse, tags=["agent-auth"])
+def approve_agent(agent_id: int, payload: ApprovalRequest, db: Session = Depends(get_db)) -> ApprovalResponse:
+    agent = get_agent_or_404(db, agent_id)
+    validate_scopes(payload.approved_scopes, agent_id=agent.id, owner_user_id=agent.owner_user_id, db=db)
+
+    requested_scopes = set(parse_scopes(agent.requested_scopes))
+    approved_scopes = set(payload.approved_scopes)
+    if not approved_scopes.issubset(requested_scopes):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Approved scopes must be a subset of originally requested scopes")
+
+    expires_at = datetime.now(timezone.utc) + timedelta(hours=payload.expires_in_hours)
+    agent.status = "approved"
+    agent.approved_scopes = ",".join(payload.approved_scopes)
+    agent.approved_by = payload.approved_by
+    agent.approval_expires_at = expires_at
+
+    record = ApprovalRecord(
+        agent_id=agent.id,
+        approved_scopes=",".join(payload.approved_scopes),
+        approved_by=payload.approved_by,
+        expires_at=expires_at,
+    )
+    db.add(record)
+    db.commit()
+    db.refresh(agent)
+
+    write_audit_log(
+        db,
+        agent_id=agent.id,
+        owner_user_id=agent.owner_user_id,
+        action="approval",
+        decision="allowed",
+        reason=f"Approved by {payload.approved_by}",
+        requested_scope=agent.approved_scopes,
+    )
+    return ApprovalResponse(agent_id=agent.id, status=agent.status, approved_scopes=payload.approved_scopes, expires_at=expires_at)
+
+
+@app.post("/agent-auth/token", response_model=TokenResponse, tags=["agent-auth"])
+def issue_token(payload: TokenRequest, db: Session = Depends(get_db)) -> TokenResponse:
+    agent = get_agent_or_404(db, payload.agent_id)
+
+    if agent.status != "approved":
+        write_audit_log(
+            db,
+            agent_id=agent.id,
+            owner_user_id=agent.owner_user_id,
+            action="token_issuing",
+            decision="denied",
+            reason="Agent is not approved",
+        )
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Agent is not approved")
+
+    if agent.revoked_at is not None or agent.status == "revoked":
+        write_audit_log(
+            db,
+            agent_id=agent.id,
+            owner_user_id=agent.owner_user_id,
+            action="token_issuing",
+            decision="revoked",
+            reason="Agent is revoked",
+        )
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Agent is revoked")
+
+    approval_expires_at = ensure_utc(agent.approval_expires_at)
+    now_utc = datetime.now(timezone.utc)
+
+    if approval_expires_at and approval_expires_at <= now_utc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Approval has expired")
+
+    approved_scopes = parse_scopes(agent.approved_scopes)
+    expires_in_hours = max(1, min(settings.token_expiry_minutes_default // 60 or 1, 24))
+    if approval_expires_at:
+        remaining_hours = max(1, int((approval_expires_at - now_utc).total_seconds() // 3600) or 1)
+        expires_in_hours = min(expires_in_hours, remaining_hours)
+
+    token, expires_at = create_scoped_token(
+        agent_id=agent.id,
+        owner_user_id=agent.owner_user_id,
+        scopes=approved_scopes,
+        expires_in_hours=expires_in_hours,
+    )
+    write_audit_log(
+        db,
+        agent_id=agent.id,
+        owner_user_id=agent.owner_user_id,
+        action="token_issuing",
+        decision="allowed",
+        reason="Scoped token issued",
+        requested_scope=",".join(approved_scopes),
+    )
+    return TokenResponse(access_token=token, token_type="bearer", expires_at=expires_at, scopes=approved_scopes)
+
+
+@app.post("/agent-auth/revoke/{agent_id}", response_model=RevocationResponse, tags=["agent-auth"])
+def revoke_agent(agent_id: int, payload: RevocationRequest, db: Session = Depends(get_db)) -> RevocationResponse:
+    agent = get_agent_or_404(db, agent_id)
+    revoked_at = datetime.now(timezone.utc)
+    agent.status = "revoked"
+    agent.revoked_at = revoked_at
+    agent.revoked_by = payload.revoked_by
+    agent.revocation_reason = payload.reason
+    db.commit()
+
+    write_audit_log(
+        db,
+        agent_id=agent.id,
+        owner_user_id=agent.owner_user_id,
+        action="revocation",
+        decision="revoked",
+        reason=f"Revoked by {payload.revoked_by}: {payload.reason}",
+    )
+    return RevocationResponse(agent_id=agent.id, status=agent.status, revoked_at=revoked_at)
+
+
+@app.get("/agent-auth/audit", response_model=list[AuditLogResponse], tags=["agent-auth"])
+def get_audit_logs(
+    agent_id: int | None = Query(default=None),
+    decision: str | None = Query(default=None),
+    tool_name: str | None = Query(default=None),
+    scope: str | None = Query(default=None),
+    user_id: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+) -> list[AuditLog]:
+    query = select(AuditLog).order_by(AuditLog.timestamp.desc(), AuditLog.id.desc())
+    if agent_id is not None:
+        query = query.where(AuditLog.agent_id == agent_id)
+    if decision:
+        query = query.where(AuditLog.decision == decision)
+    if tool_name:
+        query = query.where(AuditLog.tool_name == tool_name)
+    if scope:
+        query = query.where(AuditLog.requested_scope == scope)
+    if user_id:
+        query = query.where(AuditLog.owner_user_id == user_id)
+    return list(db.scalars(query).all())
+
+
+@app.post("/tools/hr/search_employee_policy", response_model=ToolResponse, tags=["tools"])
+def tool_hr_search_employee_policy(
+    payload: EmployeePolicySearchRequest,
+    token_payload: dict = Depends(get_token_payload),
+    db: Session = Depends(get_db),
+) -> ToolResponse:
+    _, scope = enforce_tool_policy(tool_name="hr.search_employee_policy", token_payload=token_payload, db=db)
+    return build_tool_response(tool_name="hr.search_employee_policy", required_scope=scope, payload=hr_search_employee_policy(payload.employee_query))
+
+
+@app.post("/tools/finance/get_invoice_summary", response_model=ToolResponse, tags=["tools"])
+def tool_finance_get_invoice_summary(
+    payload: InvoiceSummaryRequest,
+    token_payload: dict = Depends(get_token_payload),
+    db: Session = Depends(get_db),
+) -> ToolResponse:
+    _, scope = enforce_tool_policy(tool_name="finance.get_invoice_summary", token_payload=token_payload, db=db)
+    return build_tool_response(tool_name="finance.get_invoice_summary", required_scope=scope, payload=finance_get_invoice_summary(payload.invoice_id))
+
+
+@app.post("/tools/finance/create_expense_review", response_model=ToolResponse, tags=["tools"])
+def tool_finance_create_expense_review(
+    payload: ExpenseReviewRequest,
+    token_payload: dict = Depends(get_token_payload),
+    db: Session = Depends(get_db),
+) -> ToolResponse:
+    _, scope = enforce_tool_policy(tool_name="finance.create_expense_review", token_payload=token_payload, db=db)
+    return build_tool_response(
+        tool_name="finance.create_expense_review",
+        required_scope=scope,
+        payload=finance_create_expense_review(payload.expense_title, payload.amount, payload.currency),
+    )
+
+
+@app.post("/tools/legal/search_contract_clause", response_model=ToolResponse, tags=["tools"])
+def tool_legal_search_contract_clause(
+    payload: ContractClauseRequest,
+    token_payload: dict = Depends(get_token_payload),
+    db: Session = Depends(get_db),
+) -> ToolResponse:
+    _, scope = enforce_tool_policy(tool_name="legal.search_contract_clause", token_payload=token_payload, db=db)
+    return build_tool_response(
+        tool_name="legal.search_contract_clause",
+        required_scope=scope,
+        payload=legal_search_contract_clause(payload.contract_id, payload.clause_query),
+    )
+
+
+@app.post("/tools/legal/summarize_contract_risk", response_model=ToolResponse, tags=["tools"])
+def tool_legal_summarize_contract_risk(
+    payload: ContractRiskRequest,
+    token_payload: dict = Depends(get_token_payload),
+    db: Session = Depends(get_db),
+) -> ToolResponse:
+    _, scope = enforce_tool_policy(tool_name="legal.summarize_contract_risk", token_payload=token_payload, db=db)
+    return build_tool_response(
+        tool_name="legal.summarize_contract_risk",
+        required_scope=scope,
+        payload=legal_summarize_contract_risk(payload.contract_id),
+    )
+
+
+@app.post("/tools/ops/create_report", response_model=ToolResponse, tags=["tools"])
+def tool_ops_create_report(
+    payload: OpsReportRequest,
+    token_payload: dict = Depends(get_token_payload),
+    db: Session = Depends(get_db),
+) -> ToolResponse:
+    _, scope = enforce_tool_policy(tool_name="ops.create_report", token_payload=token_payload, db=db)
+    return build_tool_response(
+        tool_name="ops.create_report",
+        required_scope=scope,
+        payload=ops_create_report(payload.report_name, payload.department),
+    )
