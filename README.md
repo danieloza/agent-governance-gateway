@@ -2,30 +2,95 @@
 
 Agent Governance Gateway is a FastAPI-based prototype for scoped, auditable and revocable access control for enterprise AI agents. Instead of giving agents unrestricted API keys, the gateway supports agent registration, human approval, short-lived scoped credentials, policy checks, PII redaction, tool-level access control and audit logs.
 
-## What problem this solves
+This project is positioned as a governance and access-control layer for internal AI automation across HR, Finance, Legal and Operations workflows. It is not a chatbot. It is the security boundary around agent execution.
 
-Enterprise AI agents often need to work with HR, Finance, Legal or Operations workflows. The unsafe shortcut is to hand the agent direct API keys or database credentials. That breaks least privilege, makes auditability weak and turns revocation into an operational mess.
+## Why this project exists
 
-This project forces a safer workflow:
+Enterprise AI agents often need access to policies, invoices, contracts, reports and internal systems. The unsafe shortcut is to hand the agent raw API keys or direct database access.
 
-- register the agent
-- request scopes
-- wait for human approval
-- receive a short-lived scoped token
-- call tools through a policy-enforced gateway
-- redact sensitive data before it leaves the boundary
-- audit every important action
+That creates predictable failure modes:
 
-## Why agents should not receive unrestricted API keys
-
-- no scope boundaries
+- no least-privilege boundary
 - no human approval checkpoint
-- difficult revocation
+- weak revocation
 - poor auditability
-- direct path to PII and financial records
-- weak separation between agent reasoning and system permissions
+- poor explainability for allow or deny decisions
+- direct exposure to PII and sensitive business data
 
-## Architecture diagram in text form
+Agent Governance Gateway enforces a safer sequence:
+
+1. the agent registers
+2. the agent requests specific scopes
+3. a human approves a subset of scopes
+4. the gateway issues a short-lived scoped JWT
+5. every tool call goes through policy enforcement
+6. PII is redacted before responses leave the boundary
+7. every important action is written to the audit trail
+
+## Screenshots
+
+### Governance dashboard
+
+![Governance dashboard](docs/assets/dashboard-overview.png)
+
+### OpenAPI surface
+
+![OpenAPI docs](docs/assets/openapi-docs.png)
+
+## What makes it strong
+
+### 1. Scoped agent access instead of unrestricted credentials
+
+Agents do not access HR, finance or legal systems directly. They request narrow scopes such as:
+
+- `hr:policy:read`
+- `finance:invoice:read`
+- `finance:expense:create`
+- `legal:contract:read`
+- `legal:risk:summarize`
+- `ops:report:create`
+
+### 2. Human approval as a first-class control
+
+An agent can request scopes, but cannot self-authorize them. Approval is explicit and time-bounded.
+
+### 3. Short-lived JWT credentials
+
+Issued tokens are scoped, revocable in practice and designed to be re-checked at tool-call time.
+
+### 4. Policy-enforced tool gateway
+
+Every tool call goes through:
+
+- token validation
+- approval status checks
+- revoked status checks
+- tool-to-scope mapping
+- scope presence validation
+- audit logging
+- PII redaction
+
+### 5. Auditability and explainability
+
+The system records:
+
+- registration
+- approval
+- token issuance
+- revocation
+- allowed tool calls
+- denied tool calls
+- invalid scope attempts
+- policy failures
+
+The dashboard includes:
+
+- access request review
+- policy decision drill-down
+- revocation impact banner
+- recent explainable activity
+
+## Architecture
 
 ```text
 AI Agent
@@ -35,12 +100,55 @@ AI Agent
   -> POST /tools/...
        -> JWT validation
        -> Policy engine
-       -> Scope check
+       -> Tool-to-scope mapping
+       -> Approval / revocation checks
        -> Mock tool execution
        -> PII redaction
        -> Audit log write
   <- Safe structured response
 ```
+
+## Governance dashboard flow
+
+The root route `/` serves an operator-facing governance console.
+
+It highlights:
+
+- total agents
+- pending approvals
+- active tokens
+- denied requests
+- scope coverage
+- tool usage
+- security and policy controls
+- recent activity
+
+The UI also includes:
+
+- tooltip-based domain explanation
+- an approval drawer for pending requests
+- a policy decision drawer for recent audit events
+- a revocation flow that visibly affects future access state
+
+## Main endpoints
+
+### Discovery and auth
+
+- `GET /.well-known/agent-auth.json`
+- `POST /agent-auth/register`
+- `POST /agent-auth/approve/{agent_id}`
+- `POST /agent-auth/token`
+- `POST /agent-auth/revoke/{agent_id}`
+- `GET /agent-auth/audit`
+
+### Tool gateway
+
+- `POST /tools/hr/search_employee_policy`
+- `POST /tools/finance/get_invoice_summary`
+- `POST /tools/finance/create_expense_review`
+- `POST /tools/legal/search_contract_clause`
+- `POST /tools/legal/summarize_contract_risk`
+- `POST /tools/ops/create_report`
 
 ## Project structure
 
@@ -58,6 +166,10 @@ agent-governance-gateway/
     tools.py
     redaction.py
     config.py
+    static/
+      index.html
+      dashboard.css
+      dashboard.js
   tests/
     conftest.py
     test_agent_registration.py
@@ -71,49 +183,39 @@ agent-governance-gateway/
   docs/
     ARCHITECTURE.md
     REDPANDA_POSITIONING.md
+    assets/
+      dashboard-overview.png
+      openapi-docs.png
   README.md
   requirements.txt
   .env.example
   .gitignore
 ```
 
-## Main endpoints
-
-- `GET /.well-known/agent-auth.json`
-- `POST /agent-auth/register`
-- `POST /agent-auth/approve/{agent_id}`
-- `POST /agent-auth/token`
-- `POST /agent-auth/revoke/{agent_id}`
-- `GET /agent-auth/audit`
-- `POST /tools/hr/search_employee_policy`
-- `POST /tools/finance/get_invoice_summary`
-- `POST /tools/finance/create_expense_review`
-- `POST /tools/legal/search_contract_clause`
-- `POST /tools/legal/summarize_contract_risk`
-- `POST /tools/ops/create_report`
-
 ## Example flow
 
-1. Agent registers with scopes such as `finance:invoice:read`
-2. Admin approves a subset of requested scopes
-3. Agent asks for a short-lived JWT
-4. Agent calls a tool through `/tools/...`
-5. Gateway checks policy, redacts PII and writes an audit log
-6. Admin can revoke the agent at any time
+1. an agent registers with scopes such as `finance:invoice:read`
+2. an admin approves only the scopes that should be allowed
+3. the agent requests a short-lived JWT
+4. the agent calls a tool through `/tools/...`
+5. the gateway checks policy, redacts PII and writes an audit log
+6. an operator can revoke the agent at any time
+7. future token issuance and future tool calls fail after revocation
 
 ## Run locally
 
 ```bash
 python -m venv .venv
-.venv\\Scripts\\activate
+.venv\Scripts\activate
 pip install -r requirements.txt
 copy .env.example .env
 uvicorn app.main:app --reload
 ```
 
-Open docs at:
+Open:
 
-- [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs)
+- Dashboard: [http://127.0.0.1:8000/](http://127.0.0.1:8000/)
+- OpenAPI docs: [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs)
 
 ## Run tests
 
@@ -182,18 +284,43 @@ curl -X POST http://127.0.0.1:8000/tools/finance/get_invoice_summary ^
   -d "{\"invoice_id\":\"INV-2026-1001\"}"
 ```
 
-Expected result: `403` because the gateway re-checks revocation state on every tool request.
+Expected result: `403`, because the gateway re-checks revocation and policy state on every tool request.
 
 ## Enterprise AI governance mapping
 
 This prototype maps directly to internal enterprise AI automation concerns:
 
-- scoped access for internal agents
-- approval workflow before production use
-- auditability for HR, Finance, Legal and Ops requests
-- revocation when an agent is disabled or repurposed
-- PII redaction before data leaves the control layer
-- explainable allow/deny decisions
+- controlled access to internal systems
+- human approval for sensitive agent capabilities
+- audit logs for regulated workflows
+- revocation when an agent is disabled, repurposed or fails policy review
+- PII redaction before data leaves the access boundary
+- explainable allow or deny decisions
+- workflow safety for internal business automation
 
-This is not a chatbot. It is a governance and access-control layer for AI agents operating inside business workflows.
+Example internal use cases:
 
+- HR agent searching employee policy material
+- Finance agent summarizing invoices
+- Legal agent searching clauses or summarizing contract risk
+- Operations agent creating reports
+
+## Positioning
+
+This is not a generic CRUD app and not a chatbot wrapper.
+
+It is a portfolio-grade backend governance prototype for enterprise AI systems:
+
+- Python 3.12
+- FastAPI
+- SQLAlchemy
+- SQLite for MVP
+- scoped JWT credentials
+- policy enforcement
+- auditability
+- operator dashboard
+- security-oriented workflow design
+
+If you want the short version:
+
+> Agent Governance Gateway is a FastAPI-based prototype for scoped, auditable and revocable access control for enterprise AI agents. Instead of giving agents unrestricted API keys, the gateway supports agent registration, human approval, short-lived scoped credentials, policy checks, PII redaction, tool-level access control and audit logs.
