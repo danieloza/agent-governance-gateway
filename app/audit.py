@@ -9,6 +9,7 @@ from app.models import AuditLog
 def write_audit_log(
     db: Session,
     *,
+    tenant_id: str | None,
     agent_id: int | None,
     owner_user_id: str | None,
     action: str,
@@ -21,6 +22,7 @@ def write_audit_log(
 ) -> AuditLog:
     settings = get_settings()
     log = AuditLog(
+        tenant_id=tenant_id,
         agent_id=agent_id,
         owner_user_id=owner_user_id,
         action=action,
@@ -36,4 +38,3 @@ def write_audit_log(
     db.commit()
     db.refresh(log)
     return log
-

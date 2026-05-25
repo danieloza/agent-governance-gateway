@@ -23,6 +23,7 @@ class ManifestPolicyRules(BaseModel):
     pii_redaction_enabled: bool
     audit_logging_enabled: bool
     revocation_supported: bool
+    tenant_isolation_enabled: bool
 
 
 class AgentAuthManifest(BaseModel):
@@ -37,6 +38,7 @@ class AgentAuthManifest(BaseModel):
 
 
 class AgentRegistrationRequest(BaseModel):
+    tenant_id: str = Field(min_length=2, max_length=120)
     agent_name: str = Field(min_length=2, max_length=255)
     agent_type: str = Field(min_length=2, max_length=100)
     requested_scopes: list[str] = Field(min_length=1)
@@ -47,6 +49,7 @@ class AgentRegistrationRequest(BaseModel):
 
 class AgentRegistrationResponse(BaseModel):
     agent_id: int
+    tenant_id: str
     status: str
     requested_scopes: list[str]
 
@@ -59,6 +62,7 @@ class ApprovalRequest(BaseModel):
 
 class ApprovalResponse(BaseModel):
     agent_id: int
+    tenant_id: str
     status: str
     approved_scopes: list[str]
     expires_at: datetime
@@ -72,6 +76,7 @@ class TokenResponse(BaseModel):
     access_token: str
     token_type: Literal["bearer"]
     expires_at: datetime
+    tenant_id: str
     scopes: list[str]
 
 
@@ -82,6 +87,7 @@ class RevocationRequest(BaseModel):
 
 class RevocationResponse(BaseModel):
     agent_id: int
+    tenant_id: str
     status: str
     revoked_at: datetime
 
@@ -91,6 +97,7 @@ class AuditLogResponse(BaseModel):
 
     id: int
     timestamp: datetime
+    tenant_id: str | None
     agent_id: int | None
     owner_user_id: str | None
     action: str
@@ -104,6 +111,7 @@ class AuditLogResponse(BaseModel):
 
 
 class AuditLogFilters(BaseModel):
+    tenant_id: str | None = None
     agent_id: int | None = None
     decision: str | None = None
     tool_name: str | None = None
@@ -145,4 +153,3 @@ class ContractRiskRequest(BaseModel):
 class OpsReportRequest(BaseModel):
     report_name: str
     department: str
-

@@ -139,6 +139,7 @@ function renderRequests(rows) {
           <td>
             <div class="agent-name">${escapeHtml(row.agent_name)}</div>
             <div class="agent-subtitle">${escapeHtml(row.agent_type)}</div>
+            <div class="tenant-badge">${escapeHtml(row.tenant_id)}</div>
             <div class="table-actions">
               <button class="action-button primary" type="button" data-action="review" data-agent-id="${row.agent_id}">${escapeHtml(primaryActionLabel)}</button>
               ${revokeAction}
@@ -402,6 +403,10 @@ function renderReviewDrawer(agent) {
       <div class="detail-card">
         <div class="detail-label">Agent Type</div>
         <div class="detail-value">${escapeHtml(agent.agent_type)}</div>
+      </div>
+      <div class="detail-card">
+        <div class="detail-label">Tenant</div>
+        <div class="detail-value">${escapeHtml(agent.tenant_id)}</div>
       </div>
       <div class="detail-card">
         <div class="detail-label">Owner</div>

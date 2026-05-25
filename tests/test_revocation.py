@@ -2,6 +2,7 @@ def test_deny_tool_call_after_revocation(client):
     registration = client.post(
         "/agent-auth/register",
         json={
+            "tenant_id": "tenant-finance",
             "agent_name": "Revoked Bot",
             "agent_type": "finance-agent",
             "requested_scopes": ["finance:invoice:read"],
@@ -22,9 +23,8 @@ def test_deny_tool_call_after_revocation(client):
 
     response = client.post(
         "/tools/finance/get_invoice_summary",
-        headers={"Authorization": f"Bearer {token}"},
+        headers={"Authorization": f"Bearer {token}", "X-Tenant-ID": "tenant-finance"},
         json={"invoice_id": "INV-2026-012"},
     )
     assert response.status_code == 403
     assert "revoked" in response.json()["detail"]
-

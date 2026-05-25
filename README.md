@@ -63,6 +63,7 @@ Issued tokens are scoped, revocable in practice and designed to be re-checked at
 Every tool call goes through:
 
 - token validation
+- tenant boundary validation
 - approval status checks
 - revoked status checks
 - tool-to-scope mapping
@@ -70,7 +71,19 @@ Every tool call goes through:
 - audit logging
 - PII redaction
 
-### 5. Auditability and explainability
+### 5. Multi-tenant isolation for internal environments
+
+The gateway now includes an MVP multi-tenant boundary:
+
+- each agent belongs to a `tenant_id`
+- audit logs store `tenant_id`
+- issued JWTs include `tenant_id`
+- tool calls require `X-Tenant-ID`
+- the gateway denies requests when the request tenant and token tenant do not match
+
+This is useful for shared internal platforms where multiple business units, subsidiaries or customers use the same control layer.
+
+### 6. Auditability and explainability
 
 The system records:
 
@@ -195,12 +208,13 @@ agent-governance-gateway/
 ## Example flow
 
 1. an agent registers with scopes such as `finance:invoice:read`
-2. an admin approves only the scopes that should be allowed
-3. the agent requests a short-lived JWT
-4. the agent calls a tool through `/tools/...`
-5. the gateway checks policy, redacts PII and writes an audit log
-6. an operator can revoke the agent at any time
-7. future token issuance and future tool calls fail after revocation
+2. the agent is bound to a specific `tenant_id`
+3. an admin approves only the scopes that should be allowed
+4. the agent requests a short-lived JWT
+5. the agent calls a tool through `/tools/...` with `X-Tenant-ID`
+6. the gateway checks tenant match, policy, redacts PII and writes an audit log
+7. an operator can revoke the agent at any time
+8. future token issuance and future tool calls fail after revocation
 
 ## Run locally
 
@@ -230,7 +244,7 @@ pytest -q
 ```bash
 curl -X POST http://127.0.0.1:8000/agent-auth/register ^
   -H "Content-Type: application/json" ^
-  -d "{\"agent_name\":\"Finance Bot\",\"agent_type\":\"finance-agent\",\"requested_scopes\":[\"finance:invoice:read\",\"finance:expense:create\"],\"reason\":\"Invoice review workflow\",\"owner_user_id\":\"owner-001\"}"
+  -d "{\"tenant_id\":\"finance-emea\",\"agent_name\":\"Finance Bot\",\"agent_type\":\"finance-agent\",\"requested_scopes\":[\"finance:invoice:read\",\"finance:expense:create\"],\"reason\":\"Invoice review workflow\",\"owner_user_id\":\"owner-001\"}"
 ```
 
 ### 2. Approve agent
@@ -255,6 +269,7 @@ curl -X POST http://127.0.0.1:8000/agent-auth/token ^
 curl -X POST http://127.0.0.1:8000/tools/finance/get_invoice_summary ^
   -H "Content-Type: application/json" ^
   -H "Authorization: Bearer YOUR_TOKEN" ^
+  -H "X-Tenant-ID: finance-emea" ^
   -d "{\"invoice_id\":\"INV-2026-1001\"}"
 ```
 
@@ -264,6 +279,7 @@ curl -X POST http://127.0.0.1:8000/tools/finance/get_invoice_summary ^
 curl -X POST http://127.0.0.1:8000/tools/legal/search_contract_clause ^
   -H "Content-Type: application/json" ^
   -H "Authorization: Bearer YOUR_TOKEN" ^
+  -H "X-Tenant-ID: finance-emea" ^
   -d "{\"contract_id\":\"CTR-9\",\"clause_query\":\"termination\"}"
 ```
 
@@ -281,6 +297,7 @@ curl -X POST http://127.0.0.1:8000/agent-auth/revoke/1 ^
 curl -X POST http://127.0.0.1:8000/tools/finance/get_invoice_summary ^
   -H "Content-Type: application/json" ^
   -H "Authorization: Bearer YOUR_TOKEN" ^
+  -H "X-Tenant-ID: finance-emea" ^
   -d "{\"invoice_id\":\"INV-2026-1001\"}"
 ```
 

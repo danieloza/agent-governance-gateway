@@ -2,6 +2,7 @@ def test_approving_agent(client):
     registration = client.post(
         "/agent-auth/register",
         json={
+            "tenant_id": "tenant-finance",
             "agent_name": "Finance Reader",
             "agent_type": "finance-agent",
             "requested_scopes": ["finance:invoice:read", "finance:expense:create"],
@@ -20,6 +21,6 @@ def test_approving_agent(client):
     )
     assert response.status_code == 200
     data = response.json()
+    assert data["tenant_id"] == "tenant-finance"
     assert data["status"] == "approved"
     assert data["approved_scopes"] == ["finance:invoice:read"]
-

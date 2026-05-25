@@ -13,7 +13,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.audit import write_audit_log
-from app.auth import create_scoped_token, get_token_payload
+from app.auth import create_scoped_token, get_tenant_header, get_token_payload
 from app.config import get_settings
 from app.database import Base, engine, get_db
 from app.models import Agent, ApprovalRecord, AuditLog
@@ -95,6 +95,7 @@ def seed_demo_data() -> None:
         now = datetime.now(timezone.utc)
         demo_agents = [
             Agent(
+                tenant_id="redpanda-hr",
                 agent_name="HR Policy Assistant",
                 agent_type="mcp_client",
                 requested_scopes="hr:policy:read",
@@ -106,6 +107,7 @@ def seed_demo_data() -> None:
                 approval_expires_at=now + timedelta(hours=24),
             ),
             Agent(
+                tenant_id="redpanda-finance",
                 agent_name="Finance Invoice Agent",
                 agent_type="service_agent",
                 requested_scopes="finance:invoice:read,finance:expense:create",
@@ -115,6 +117,7 @@ def seed_demo_data() -> None:
                 status="pending_approval",
             ),
             Agent(
+                tenant_id="redpanda-legal",
                 agent_name="Legal Contract Analyst",
                 agent_type="mcp_client",
                 requested_scopes="legal:contract:read,legal:risk:summarize",
@@ -126,6 +129,7 @@ def seed_demo_data() -> None:
                 approval_expires_at=now + timedelta(hours=12),
             ),
             Agent(
+                tenant_id="redpanda-ops",
                 agent_name="Ops Report Builder",
                 agent_type="workflow_agent",
                 requested_scopes="ops:report:create",
@@ -148,6 +152,7 @@ def seed_demo_data() -> None:
 
         demo_logs = [
             AuditLog(
+                tenant_id="redpanda-finance",
                 agent_id=by_name["Finance Invoice Agent"].id,
                 owner_user_id="michal.nowak",
                 action="registration",
@@ -157,6 +162,7 @@ def seed_demo_data() -> None:
                 pii_redacted=True,
             ),
             AuditLog(
+                tenant_id="redpanda-hr",
                 agent_id=by_name["HR Policy Assistant"].id,
                 owner_user_id="anna.kowalska",
                 action="approval",
@@ -167,6 +173,7 @@ def seed_demo_data() -> None:
                 pii_redacted=True,
             ),
             AuditLog(
+                tenant_id="redpanda-hr",
                 agent_id=by_name["HR Policy Assistant"].id,
                 owner_user_id="anna.kowalska",
                 action="token_issuing",
@@ -176,6 +183,7 @@ def seed_demo_data() -> None:
                 pii_redacted=True,
             ),
             AuditLog(
+                tenant_id="redpanda-legal",
                 agent_id=by_name["Legal Contract Analyst"].id,
                 owner_user_id="justyna.zz",
                 action="denied_tool_call",
@@ -188,6 +196,7 @@ def seed_demo_data() -> None:
                 latency_ms=18,
             ),
             AuditLog(
+                tenant_id="redpanda-hr",
                 agent_id=by_name["HR Policy Assistant"].id,
                 owner_user_id="anna.kowalska",
                 action="allowed_tool_call",
@@ -200,6 +209,7 @@ def seed_demo_data() -> None:
                 latency_ms=11,
             ),
             AuditLog(
+                tenant_id="redpanda-ops",
                 agent_id=by_name["Ops Report Builder"].id,
                 owner_user_id="piotr.wrobel",
                 action="revocation",
@@ -220,11 +230,12 @@ def get_agent_or_404(db: Session, agent_id: int) -> Agent:
     return agent
 
 
-def validate_scopes(scopes: list[str], *, agent_id: int | None, owner_user_id: str, db: Session) -> None:
+def validate_scopes(scopes: list[str], *, tenant_id: str | None, agent_id: int | None, owner_user_id: str, db: Session) -> None:
     invalid = [scope for scope in scopes if scope not in VALID_SCOPES]
     if invalid:
         write_audit_log(
             db,
+            tenant_id=tenant_id,
             agent_id=agent_id,
             owner_user_id=owner_user_id,
             action="invalid_scope_attempt",
@@ -250,6 +261,7 @@ def enforce_tool_policy(
     *,
     tool_name: str,
     token_payload: dict,
+    tenant_id: str,
     db: Session,
 ) -> tuple[Agent, str]:
     started = perf_counter()
@@ -263,11 +275,29 @@ def enforce_tool_policy(
     )
     latency_ms = int((perf_counter() - started) * 1000)
     owner_user_id = token_payload.get("owner_user_id")
+    token_tenant_id = token_payload.get("tenant_id")
+
+    if token_tenant_id != tenant_id:
+        write_audit_log(
+            db,
+            tenant_id=token_tenant_id,
+            agent_id=agent_id,
+            owner_user_id=owner_user_id,
+            action="policy_failure",
+            tool_name=tool_name,
+            requested_scope=TOOL_SCOPE_MAP.get(tool_name),
+            decision="denied",
+            reason="default_deny: request tenant does not match token tenant",
+            pii_redacted=True,
+            latency_ms=latency_ms,
+        )
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="default_deny: request tenant does not match token tenant")
 
     if not decision.allowed:
         action = "policy_failure" if "default_deny" in decision.reason else "denied_tool_call"
         write_audit_log(
             db,
+            tenant_id=token_tenant_id,
             agent_id=agent_id,
             owner_user_id=owner_user_id,
             action=action,
@@ -282,6 +312,7 @@ def enforce_tool_policy(
 
     write_audit_log(
         db,
+        tenant_id=token_tenant_id,
         agent_id=agent_id,
         owner_user_id=owner_user_id,
         action="allowed_tool_call",
@@ -306,6 +337,7 @@ def dashboard_overview(db: Session = Depends(get_db)) -> dict:
     audit_logs = list(db.scalars(select(AuditLog).order_by(AuditLog.timestamp.desc())).all())
 
     total_agents = len(agents)
+    total_tenants = len({agent.tenant_id for agent in agents})
     pending_approvals = sum(1 for agent in agents if agent.status == "pending_approval")
     approved_agents = sum(1 for agent in agents if agent.status == "approved")
     revoked_agents = sum(1 for agent in agents if agent.status == "revoked")
@@ -341,6 +373,7 @@ def dashboard_overview(db: Session = Depends(get_db)) -> dict:
                 [18, 24, 20, 28, 25, 30, 27, 34],
                 [9, 12, 18, 14, 17, 19, 16, 28],
             ],
+            "total_tenants": total_tenants,
         },
         "scope_distribution": scope_distribution,
         "tool_usage": [
@@ -373,6 +406,7 @@ def dashboard_access_requests(db: Session = Depends(get_db)) -> dict:
         rows.append(
             {
                 "agent_id": agent.id,
+                "tenant_id": agent.tenant_id,
                 "agent_name": agent.agent_name,
                 "agent_type": agent.agent_type,
                 "requested_scopes": parse_scopes(agent.requested_scopes),
@@ -401,6 +435,7 @@ def dashboard_recent_activity(db: Session = Depends(get_db)) -> dict:
         items.append(
             {
                 "id": log.id,
+                "tenant_id": log.tenant_id,
                 "agent_id": log.agent_id,
                 "owner_user_id": log.owner_user_id,
                 "title": title,
@@ -437,14 +472,16 @@ def get_manifest() -> AgentAuthManifest:
             pii_redaction_enabled=True,
             audit_logging_enabled=True,
             revocation_supported=True,
+            tenant_isolation_enabled=True,
         ),
     )
 
 
 @app.post("/agent-auth/register", response_model=AgentRegistrationResponse, status_code=status.HTTP_201_CREATED, tags=["agent-auth"])
 def register_agent(payload: AgentRegistrationRequest, db: Session = Depends(get_db)) -> AgentRegistrationResponse:
-    validate_scopes(payload.requested_scopes, agent_id=None, owner_user_id=payload.owner_user_id, db=db)
+    validate_scopes(payload.requested_scopes, tenant_id=payload.tenant_id, agent_id=None, owner_user_id=payload.owner_user_id, db=db)
     agent = Agent(
+        tenant_id=payload.tenant_id,
         agent_name=payload.agent_name,
         agent_type=payload.agent_type,
         requested_scopes=",".join(payload.requested_scopes),
@@ -459,6 +496,7 @@ def register_agent(payload: AgentRegistrationRequest, db: Session = Depends(get_
 
     write_audit_log(
         db,
+        tenant_id=agent.tenant_id,
         agent_id=agent.id,
         owner_user_id=agent.owner_user_id,
         action="registration",
@@ -466,13 +504,13 @@ def register_agent(payload: AgentRegistrationRequest, db: Session = Depends(get_
         reason="Agent registered and waiting for human approval",
         requested_scope=agent.requested_scopes,
     )
-    return AgentRegistrationResponse(agent_id=agent.id, status=agent.status, requested_scopes=payload.requested_scopes)
+    return AgentRegistrationResponse(agent_id=agent.id, tenant_id=agent.tenant_id, status=agent.status, requested_scopes=payload.requested_scopes)
 
 
 @app.post("/agent-auth/approve/{agent_id}", response_model=ApprovalResponse, tags=["agent-auth"])
 def approve_agent(agent_id: int, payload: ApprovalRequest, db: Session = Depends(get_db)) -> ApprovalResponse:
     agent = get_agent_or_404(db, agent_id)
-    validate_scopes(payload.approved_scopes, agent_id=agent.id, owner_user_id=agent.owner_user_id, db=db)
+    validate_scopes(payload.approved_scopes, tenant_id=agent.tenant_id, agent_id=agent.id, owner_user_id=agent.owner_user_id, db=db)
 
     requested_scopes = set(parse_scopes(agent.requested_scopes))
     approved_scopes = set(payload.approved_scopes)
@@ -486,6 +524,7 @@ def approve_agent(agent_id: int, payload: ApprovalRequest, db: Session = Depends
     agent.approval_expires_at = expires_at
 
     record = ApprovalRecord(
+        tenant_id=agent.tenant_id,
         agent_id=agent.id,
         approved_scopes=",".join(payload.approved_scopes),
         approved_by=payload.approved_by,
@@ -497,6 +536,7 @@ def approve_agent(agent_id: int, payload: ApprovalRequest, db: Session = Depends
 
     write_audit_log(
         db,
+        tenant_id=agent.tenant_id,
         agent_id=agent.id,
         owner_user_id=agent.owner_user_id,
         action="approval",
@@ -504,7 +544,7 @@ def approve_agent(agent_id: int, payload: ApprovalRequest, db: Session = Depends
         reason=f"Approved by {payload.approved_by}",
         requested_scope=agent.approved_scopes,
     )
-    return ApprovalResponse(agent_id=agent.id, status=agent.status, approved_scopes=payload.approved_scopes, expires_at=expires_at)
+    return ApprovalResponse(agent_id=agent.id, tenant_id=agent.tenant_id, status=agent.status, approved_scopes=payload.approved_scopes, expires_at=expires_at)
 
 
 @app.post("/agent-auth/token", response_model=TokenResponse, tags=["agent-auth"])
@@ -514,6 +554,7 @@ def issue_token(payload: TokenRequest, db: Session = Depends(get_db)) -> TokenRe
     if agent.status != "approved":
         write_audit_log(
             db,
+            tenant_id=agent.tenant_id,
             agent_id=agent.id,
             owner_user_id=agent.owner_user_id,
             action="token_issuing",
@@ -525,6 +566,7 @@ def issue_token(payload: TokenRequest, db: Session = Depends(get_db)) -> TokenRe
     if agent.revoked_at is not None or agent.status == "revoked":
         write_audit_log(
             db,
+            tenant_id=agent.tenant_id,
             agent_id=agent.id,
             owner_user_id=agent.owner_user_id,
             action="token_issuing",
@@ -547,12 +589,14 @@ def issue_token(payload: TokenRequest, db: Session = Depends(get_db)) -> TokenRe
 
     token, expires_at = create_scoped_token(
         agent_id=agent.id,
+        tenant_id=agent.tenant_id,
         owner_user_id=agent.owner_user_id,
         scopes=approved_scopes,
         expires_in_hours=expires_in_hours,
     )
     write_audit_log(
         db,
+        tenant_id=agent.tenant_id,
         agent_id=agent.id,
         owner_user_id=agent.owner_user_id,
         action="token_issuing",
@@ -560,7 +604,7 @@ def issue_token(payload: TokenRequest, db: Session = Depends(get_db)) -> TokenRe
         reason="Scoped token issued",
         requested_scope=",".join(approved_scopes),
     )
-    return TokenResponse(access_token=token, token_type="bearer", expires_at=expires_at, scopes=approved_scopes)
+    return TokenResponse(access_token=token, token_type="bearer", expires_at=expires_at, tenant_id=agent.tenant_id, scopes=approved_scopes)
 
 
 @app.post("/agent-auth/revoke/{agent_id}", response_model=RevocationResponse, tags=["agent-auth"])
@@ -575,17 +619,19 @@ def revoke_agent(agent_id: int, payload: RevocationRequest, db: Session = Depend
 
     write_audit_log(
         db,
+        tenant_id=agent.tenant_id,
         agent_id=agent.id,
         owner_user_id=agent.owner_user_id,
         action="revocation",
         decision="revoked",
         reason=f"Revoked by {payload.revoked_by}: {payload.reason}",
     )
-    return RevocationResponse(agent_id=agent.id, status=agent.status, revoked_at=revoked_at)
+    return RevocationResponse(agent_id=agent.id, tenant_id=agent.tenant_id, status=agent.status, revoked_at=revoked_at)
 
 
 @app.get("/agent-auth/audit", response_model=list[AuditLogResponse], tags=["agent-auth"])
 def get_audit_logs(
+    tenant_id: str | None = Query(default=None),
     agent_id: int | None = Query(default=None),
     decision: str | None = Query(default=None),
     tool_name: str | None = Query(default=None),
@@ -594,6 +640,8 @@ def get_audit_logs(
     db: Session = Depends(get_db),
 ) -> list[AuditLog]:
     query = select(AuditLog).order_by(AuditLog.timestamp.desc(), AuditLog.id.desc())
+    if tenant_id:
+        query = query.where(AuditLog.tenant_id == tenant_id)
     if agent_id is not None:
         query = query.where(AuditLog.agent_id == agent_id)
     if decision:
@@ -611,9 +659,10 @@ def get_audit_logs(
 def tool_hr_search_employee_policy(
     payload: EmployeePolicySearchRequest,
     token_payload: dict = Depends(get_token_payload),
+    tenant_id: str = Depends(get_tenant_header),
     db: Session = Depends(get_db),
 ) -> ToolResponse:
-    _, scope = enforce_tool_policy(tool_name="hr.search_employee_policy", token_payload=token_payload, db=db)
+    _, scope = enforce_tool_policy(tool_name="hr.search_employee_policy", token_payload=token_payload, tenant_id=tenant_id, db=db)
     return build_tool_response(tool_name="hr.search_employee_policy", required_scope=scope, payload=hr_search_employee_policy(payload.employee_query))
 
 
@@ -621,9 +670,10 @@ def tool_hr_search_employee_policy(
 def tool_finance_get_invoice_summary(
     payload: InvoiceSummaryRequest,
     token_payload: dict = Depends(get_token_payload),
+    tenant_id: str = Depends(get_tenant_header),
     db: Session = Depends(get_db),
 ) -> ToolResponse:
-    _, scope = enforce_tool_policy(tool_name="finance.get_invoice_summary", token_payload=token_payload, db=db)
+    _, scope = enforce_tool_policy(tool_name="finance.get_invoice_summary", token_payload=token_payload, tenant_id=tenant_id, db=db)
     return build_tool_response(tool_name="finance.get_invoice_summary", required_scope=scope, payload=finance_get_invoice_summary(payload.invoice_id))
 
 
@@ -631,9 +681,10 @@ def tool_finance_get_invoice_summary(
 def tool_finance_create_expense_review(
     payload: ExpenseReviewRequest,
     token_payload: dict = Depends(get_token_payload),
+    tenant_id: str = Depends(get_tenant_header),
     db: Session = Depends(get_db),
 ) -> ToolResponse:
-    _, scope = enforce_tool_policy(tool_name="finance.create_expense_review", token_payload=token_payload, db=db)
+    _, scope = enforce_tool_policy(tool_name="finance.create_expense_review", token_payload=token_payload, tenant_id=tenant_id, db=db)
     return build_tool_response(
         tool_name="finance.create_expense_review",
         required_scope=scope,
@@ -645,9 +696,10 @@ def tool_finance_create_expense_review(
 def tool_legal_search_contract_clause(
     payload: ContractClauseRequest,
     token_payload: dict = Depends(get_token_payload),
+    tenant_id: str = Depends(get_tenant_header),
     db: Session = Depends(get_db),
 ) -> ToolResponse:
-    _, scope = enforce_tool_policy(tool_name="legal.search_contract_clause", token_payload=token_payload, db=db)
+    _, scope = enforce_tool_policy(tool_name="legal.search_contract_clause", token_payload=token_payload, tenant_id=tenant_id, db=db)
     return build_tool_response(
         tool_name="legal.search_contract_clause",
         required_scope=scope,
@@ -659,9 +711,10 @@ def tool_legal_search_contract_clause(
 def tool_legal_summarize_contract_risk(
     payload: ContractRiskRequest,
     token_payload: dict = Depends(get_token_payload),
+    tenant_id: str = Depends(get_tenant_header),
     db: Session = Depends(get_db),
 ) -> ToolResponse:
-    _, scope = enforce_tool_policy(tool_name="legal.summarize_contract_risk", token_payload=token_payload, db=db)
+    _, scope = enforce_tool_policy(tool_name="legal.summarize_contract_risk", token_payload=token_payload, tenant_id=tenant_id, db=db)
     return build_tool_response(
         tool_name="legal.summarize_contract_risk",
         required_scope=scope,
@@ -673,9 +726,10 @@ def tool_legal_summarize_contract_risk(
 def tool_ops_create_report(
     payload: OpsReportRequest,
     token_payload: dict = Depends(get_token_payload),
+    tenant_id: str = Depends(get_tenant_header),
     db: Session = Depends(get_db),
 ) -> ToolResponse:
-    _, scope = enforce_tool_policy(tool_name="ops.create_report", token_payload=token_payload, db=db)
+    _, scope = enforce_tool_policy(tool_name="ops.create_report", token_payload=token_payload, tenant_id=tenant_id, db=db)
     return build_tool_response(
         tool_name="ops.create_report",
         required_scope=scope,

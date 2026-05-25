@@ -12,6 +12,7 @@ class Agent(Base):
     __tablename__ = "agents"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    tenant_id: Mapped[str] = mapped_column(String(120), nullable=False, index=True)
     agent_name: Mapped[str] = mapped_column(String(255), nullable=False)
     agent_type: Mapped[str] = mapped_column(String(100), nullable=False)
     requested_scopes: Mapped[str] = mapped_column(Text, nullable=False)
@@ -38,6 +39,7 @@ class ApprovalRecord(Base):
     __tablename__ = "approval_records"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(120), nullable=False, index=True)
     agent_id: Mapped[int] = mapped_column(ForeignKey("agents.id"), nullable=False, index=True)
     approved_scopes: Mapped[str] = mapped_column(Text, nullable=False)
     approved_by: Mapped[str] = mapped_column(String(255), nullable=False)
@@ -52,6 +54,7 @@ class AuditLog(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    tenant_id: Mapped[str | None] = mapped_column(String(120), nullable=True, index=True)
     agent_id: Mapped[int | None] = mapped_column(ForeignKey("agents.id"), nullable=True, index=True)
     owner_user_id: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
     action: Mapped[str] = mapped_column(String(120), nullable=False, index=True)
@@ -64,4 +67,3 @@ class AuditLog(Base):
     latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     agent: Mapped[Agent | None] = relationship(back_populates="audit_logs")
-

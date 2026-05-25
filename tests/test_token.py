@@ -2,6 +2,7 @@ def test_issue_token_for_approved_agent(client):
     registration = client.post(
         "/agent-auth/register",
         json={
+            "tenant_id": "tenant-legal",
             "agent_name": "Legal Risk Bot",
             "agent_type": "legal-agent",
             "requested_scopes": ["legal:risk:summarize"],
@@ -18,6 +19,7 @@ def test_issue_token_for_approved_agent(client):
     assert response.status_code == 200
     data = response.json()
     assert data["token_type"] == "bearer"
+    assert data["tenant_id"] == "tenant-legal"
     assert data["scopes"] == ["legal:risk:summarize"]
 
 
@@ -25,6 +27,7 @@ def test_refuse_token_for_pending_agent(client):
     registration = client.post(
         "/agent-auth/register",
         json={
+            "tenant_id": "tenant-ops",
             "agent_name": "Pending Bot",
             "agent_type": "ops-agent",
             "requested_scopes": ["ops:report:create"],
@@ -36,4 +39,3 @@ def test_refuse_token_for_pending_agent(client):
     response = client.post("/agent-auth/token", json={"agent_id": registration["agent_id"]})
     assert response.status_code == 403
     assert response.json()["detail"] == "Agent is not approved"
-

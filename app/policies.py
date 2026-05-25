@@ -66,6 +66,9 @@ def evaluate_tool_access(
     if int(token_payload.get("agent_id", -1)) != agent.id:
         return PolicyDecision(False, "default_deny: token agent mismatch", required_scope, policy_version, pii_redaction_required)
 
+    if token_payload.get("tenant_id") != agent.tenant_id:
+        return PolicyDecision(False, "default_deny: tenant mismatch", required_scope, policy_version, pii_redaction_required)
+
     exp_ts = token_payload.get("exp")
     if exp_ts is None:
         return PolicyDecision(False, "default_deny: token missing expiration", required_scope, policy_version, pii_redaction_required)
